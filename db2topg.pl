@@ -7,6 +7,7 @@
 #
 #  DESCRIPTION: Convert a DB2 SQL schema dump to a PostgreSQL dump
 #
+# NGO FORK UNDER DEV
 #===============================================================================
 
 use strict;
@@ -33,12 +34,46 @@ my $db2dbname;
 my $db2username;
 my $db2password;
 
+
+our @KEYWORDS = qw(
+	ALL ANALYSE ANALYZE AND ANY ARRAY AS ASC ASYMMETRIC AUTHORIZATION BOTH CASE
+	CAST CHECK COLLATE COLLATION COLUMN CONCURRENTLY CONSTRAINT CREATE CROSS
+	CURRENT_CATALOG CURRENT_DATE CURRENT_ROLE CURRENT_SCHEMA CURRENT_TIME
+	CURRENT_TIMESTAMP CURRENT_USER DEFAULT DEFERRABLE DESC DISTINCT DO ELSE
+	END EXCEPT FALSE FETCH FOR FOREIGN FREEZE FROM FULL GRANT GROUP HAVING
+	ILIKE IN INITIALLY INTERSECT INTO IS ISNULL JOIN LEADING LEFT LIKE
+	LIMIT LOCALTIME LOCALTIMESTAMP NATURAL NOT NOTNULL NULL OFFSET ON ONLY
+	OR ORDER OUTER OVER OVERLAPS PLACING PRIMARY REFERENCES RETURNING RIGHT
+	SELECT SESSION_USER SIMILAR SOME SYMMETRIC TABLE THEN TO TRAILING TRUE
+	UNION UNIQUE USER USING VARIADIC VERBOSE WHEN WHERE WINDOW WITH
+);
+
+our @SYSTEM_FIELDS = qw(oid tableoid xmin xmin cmin xmax cmax ctid);
+
+
+
 sub read_and_cleanup_line
 {
 	my $line=<IN>;
 	return undef if (not defined $line);
 	$line=~ s/--.*//;
 	return $line;
+}
+
+sub check_reserved_words
+{
+	my $objname = @_;
+	print $objname;
+	if (grep(/^$objname$/i, @SYSTEM_FIELDS)) {
+		print STDERR "==>Warning: $objname is PostgreSQL reserved system column!<==\n";
+		return uc $objname;
+	}
+	elsif (grep(/^$objname$/i, @SYSTEM_FIELDS)) {
+		print STDERR "==>Warning: $objname is PostgreSQL reserved keyword!<==\n";
+		return uc "\"$objname\"";
+	}else{
+		return $objname;
+	}
 }
 
 sub read_statement
@@ -155,9 +190,20 @@ sub convert_type
 	{
 		$out_type="bytea"; # Could add a check constraint to verify size, but most of the time, the size is here 
 	}
-	elsif ($in_type =~ /^CLOB\((\d+)\)/)
+	elsif ($in_type =~ /^CLOB\((\d+)(?:\sOCTETS)\)/)
 	{
-		$out_type="varchar($1)"; # That's just a varchar to us, as these can store up to 1GB
+		# DB2 "CLOG(n)" is varying-length character strings where n is between 1 and 2 147 483 648
+		# PostgreSQL varchar(n), n connot exceed 10485760;  Maybe even if it's not recommended, you can use the LargeObject. 
+		if ($1 > 10485760){
+			print STDERR "==>Warning: DB2 CLOB($1) is to big, DB2 CLOB(n) to PostgreSQL varchar(n) is limited to 10485760<==\n";
+			$out_type="varchar(10485760)"; # That's just a varchar to us, as these can store up to 1GB
+		}else{
+			$out_type="varchar($1)"; # That's just a varchar to us, as these can store up to 1GB
+		}
+	}
+	elsif ($in_type =~ /^VARCHAR\((\d+)(?:\sOCTETS)\)/)
+	{
+		$out_type="varchar($1)"; # Remove OCTETS
 	}
 	elsif ($in_type eq 'DOUBLE')
 	{
@@ -331,7 +377,8 @@ sub parse_dump
 		next if ($line =~ /^ALTER TABLESPACE/);
 		next if ($line =~ /^COMMIT WORK/);
 		next if ($line =~ /^TERMINATE/);
-			if ($line =~ /^CREATE (?:REGULAR|LARGE|(?:USER )?TEMPORARY) TABLESPACE "(.*?)\s*"/)
+		
+		if ($line =~ /^CREATE (?:REGULAR|LARGE|(?:USER )?TEMPORARY) TABLESPACE "(.*?)\s*"/)
 		{
 			# Parse tablespace
 			my $name=$1;
@@ -361,7 +408,7 @@ sub parse_dump
 						next;
 					}
 				}
-				next if ($line =~ /EXTENTSIZE|PREFETCHSIZE|BUFFERPOOL|OVERHEAD|TRANSFERRATE|AUTORESIZE|INCREASESIZE|MAXSIZE|FILE SYSTEM CACHING|DROPPED TABLE/);
+				next if ($line =~ /PAGESIZE|MANAGED BY|EXTENTSIZE|PREFETCHSIZE|BUFFERPOOL|OVERHEAD|NO FILE SYSTEM CACHING|FILE SYSTEM CACHING|TRANSFERRATE|DATA TAG|DROPPED TABLE|USING STOGROUP|AUTORESIZE|INCREASESIZE|MAXSIZE|INITIALSIZE/);
 				die "I don't understand $line in a CREATE TABLESPACE section";
 			}
 		} #CREATE TABLESPACE
@@ -378,18 +425,33 @@ sub parse_dump
 			$schema_db2->{ROLES}->{$1}->{COMMENT}=$2 . "\n" . slurp_comment($refstatement);
 			chomp $schema_db2->{ROLES}->{$1}->{COMMENT};
 		}
-		elsif ($line =~ /^CREATE SCHEMA "(.*?)\s*"\s+AUTHORIZATION\s+"(.*)\s*"\s*$/)
+		elsif ($line =~ /^CREATE SCHEMA/)
 		{
-			$schema_db2->{SCHEMAS}->{$1}->{AUTHORIZATION}=$2;
-			# Some roles may be there, and not have been created. I don't know why db2 would do this, but take care of it…
-			unless (exists $schema_db2->{ROLES}->{$2})
+			# with AUTHORIZATION 
+			if ($line =~ /^CREATE SCHEMA "(.*?)\s*"\s+AUTHORIZATION\s+"(.*)\s*"\s*$/)
 			{
-				my %empty_hash=();
-				$schema_db2->{ROLES}->{$2}=\%empty_hash;
+				$schema_db2->{SCHEMAS}->{$1}->{AUTHORIZATION}=$2;
+				# Some roles may be there, and not have been created. I don't know why db2 would do this, but take care of it…
+				unless (exists $schema_db2->{ROLES}->{$2})
+				{
+					my %empty_hash=();
+					$schema_db2->{ROLES}->{$2}=\%empty_hash;
+				}
+				die ("Overflow in create schema: " . join('',@$refstatement)) unless ($#$refstatement == -1);
+			}elsif($line =~ /^CREATE SCHEMA "(.*?)\s*"$/){
+ 
+				# if no AUTHORIZATION set, AUTHORIZATION is same that SCHEMA name...
+				$schema_db2->{SCHEMAS}->{$1}->{AUTHORIZATION}=$1;
+				unless (exists $schema_db2->{ROLES}->{$1})
+				{
+					my %empty_hash=();
+					$schema_db2->{ROLES}->{$1}=\%empty_hash;
+				}
+				die ("Overflow in create schema: " . join('',@$refstatement)) unless ($#$refstatement == -1);
+
 			}
-			die ("Overflow in create schema: " . join('',@$refstatement)) unless ($#$refstatement == -1);
 		}
-		elsif ($line =~ /^CREATE SEQUENCE "(.*?)\s*"\."(.*?)\s*" AS INTEGER$/)
+		elsif ($line =~ /^CREATE SEQUENCE "(.*?)\s*"\."(.*?)\s*" AS (?:SMALLINT|INTEGER|INT|BIGINT|DECIMAL|DEC|NUMERIC|NUM)$/)
 		{
 			my $schema=$1;
 			my $sequence=$2;
@@ -441,9 +503,18 @@ sub parse_dump
 				if ($line =~ /^\s+"(.*?)\s*"\s+(.+?)( NOT NULL)?(?: WITH DEFAULT (.*?)| GENERATED (BY DEFAULT|ALWAYS) AS IDENTITY \(| GENERATED (BY DEFAULT|ALWAYS) AS \((.*?)\))?( ,| \))?\s*$/)
 				{
 					my ($colname,$coltype,$colnotnull,$coldefault,$colgeneratedbydefaultidentity,$colgeneratedbydefaultexpression,$colgeneratedbydefaultexpressionAS,$endofline)=($1,$2,$3,$4,$5,$6,$7,$8);
+					# check colname is a postgresql keywords or system column name
+					if (check_reserved_words($colname)){
+						print ">>RESERVED column name detected, please rename it!"
+					}
+
+
 					$schema_db2->{SCHEMAS}->{$schema}->{TABLES}->{$table}->{COLS}->{$colname}->{TYPE}=convert_type($coltype);
 					$schema_db2->{SCHEMAS}->{$schema}->{TABLES}->{$table}->{COLS}->{$colname}->{ORIGTYPE}=$coltype;
 					$schema_db2->{SCHEMAS}->{$schema}->{TABLES}->{$table}->{COLS}->{$colname}->{COLNUM}=$colnum;
+
+					
+
 					if (defined ($colnotnull))
 					{
 						$schema_db2->{SCHEMAS}->{$schema}->{TABLES}->{$table}->{COLS}->{$colname}->{NOTNULL}=1;
@@ -535,6 +606,21 @@ sub parse_dump
 						$schema_db2->{SCHEMAS}->{$schema}->{TABLES}->{$table}->{TBSINDEX}=$2 if (defined $2);
 						$schema_db2->{SCHEMAS}->{$schema}->{TABLES}->{$table}->{TBSLONG}=$3 if (defined $3);
 				}
+				elsif ($line =~ /ORGANIZE BY ((?:ROW USING|ROW|COLUMN USING|COLUMN))/){
+					# Skeep 'ORGANIZE BY' definition (no yet equivalence in postgresql)
+					if ($1 eq 'ROW USING' || $1 eq 'COLUMN USING')
+					{
+						while (my $line=shift(@$refstatement)){
+							# do nothing
+						}
+
+					}
+					else
+					{
+						# do nothing	
+					}
+					
+				}
 				else
 				{
 					die "I don't understand $line in a CREATE TABLE section";
@@ -620,7 +706,7 @@ sub parse_dump
 				}
 				while (my $line=shift(@$refstatement))
 				{
-					if ($line =~/^\s+(?:ON (DELETE|UPDATE) (RESTRICT|NO ACTION|CASCADE)|(ENFORCED)|(ENABLE QUERY OPTIMIZATION))\s*;?$/)
+					if ($line =~/^\s+(?:ON (DELETE|UPDATE) (RESTRICT|NO ACTION|CASCADE|SET NULL)|(ENFORCED)|(ENABLE QUERY OPTIMIZATION))\s*;?$/)
 					{
 						if (defined $3)
 						{
@@ -741,6 +827,10 @@ sub parse_dump
 			{
 				die ("Overflow in comment on column: " . join('',@$refstatement)) unless ($#$refstatement == -1);
 			}
+			elsif ($line =~ /COMPRESS (?:NO|YES)/)
+			{
+				# Ignored no supported option  
+			}
 			else
 			{
 				die "I don't understand $line in an CREATE INDEX section";
@@ -846,10 +936,20 @@ sub parse_dump
 			$schema_db2->{SCHEMAS}->{$1}->{TRIGGERS}->{$2}->{COMMENT}=$3 . "\n" . slurp_comment($refstatement);
 			chomp $schema_db2->{SCHEMAS}->{$1}->{TRIGGERS}->{$2}->{COMMENT};
 		}
-		elsif ($line =~ /^CREATE FUNCTION (\S+)\.(\S+)/)
+		elsif ($line =~ /^CREATE FUNCTION (?:(\S+)\s*\.)?(\S+)\s*(.*?)$/i)
 		{
+			my $schema;
+
 			# These are functions. Languages are completely different
-			my $schema=$1;
+			if (defined $1)
+			{
+				$schema=$1;	
+			}
+			else
+			{
+				$schema=$current_schema
+			}
+			print $3;
 			my $function=$2;
 			# There can be quotes and whatever in these, depending on how the person has created the function
 			$schema =~ s/^"//;
@@ -875,6 +975,11 @@ sub parse_dump
 			# The privilege system is too different. Just ignore it
 			next;
 		}
+                elsif ($line =~ /^ALTER STOGROUP|SET NLS_STRING_UNITS/) # ngo
+                {
+                        # The privilege system is too different. Just ignore it
+                        next;
+                }
 		else
 		{
 			die "I don't understand <$line>";
